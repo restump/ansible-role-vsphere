@@ -1,0 +1,24 @@
+---
+- hosts: vce-s1
+  connection: local
+  gather_facts: no
+  
+  vars_prompt:
+    - name: "vsphere_username"
+      prompt: "Username"
+      private: no
+      default: "administrator"
+      
+    - name: "vsphere_password"
+      prompt: "Password"
+      private: yes
+      
+  tasks:
+    - name: Initialize vSphere session
+      vsphere_session:
+        state: present
+        hostname: "{{ inventory_hostname }}"
+        username: "{{ vsphere_username }}"
+        password: "{{ vsphere_password }}"
+      register: result
+    - debug: msg="Session key = {{ result.session.key }}"

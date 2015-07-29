@@ -1,0 +1,249 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+# (c) 2015, Reuben Stump <reuben.stump@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at 
+#
+#	http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+DOCUMENTATION = '''
+---
+module: vsphere_session
+author: Reuben Stump
+version_added: "1.9"
+short_description: Session management for the vSphere API
+requirements:
+	- pyvmomi
+description:
+	- Manage Ansible local connection session to the vSphere API
+options:
+	state:
+		required: true
+		choices: ["absent", "present"]
+		default: present
+		description:
+			- Invoke requested session action (update)
+	hostname:
+		required: true
+		description:
+			- Host name or ip address
+	username:
+		required: false
+		default: root
+		description:
+			- User account name for session login
+	password:
+		required: false
+		description:
+			- User account password for session login
+'''
+
+from pyVmomi		import vim, SoapStubAdapter
+from pyVim.connect	import SmartConnect
+import md5, os, stat, requests, datetime
+
+# Disable certificate validation warnings; not ideal, but non-json results will impact
+# Ansible runtime
+requests.packages.urllib3.disable_warnings()
+
+CACHE_PATH = ['.ansible', 'vsphere', 'cache']
+
+class SessionCache(object):
+	def __init__(self, cache=None, hostname='localhost', username='root', password=None):
+		
+		self.cache = dict(
+			file = cache,
+			path = os.path.join(os.getenv("HOME"), os.path.sep.join(CACHE_PATH)) )
+		self.session = dict(
+			hostname = hostname,
+			username = username,
+			password = password,
+			version  = None,
+			session  = None )
+			
+		if not self.cache['file']:
+			digest = md5.new(username + " " + hostname)
+			self.cache['file'] = digest.hexdigest()
+		
+		self.exception = None
+		self.instance  = None
+		self.load_session()
+		return
+		
+	def load_session(self):
+		cache_file_path = os.path.join(self.cache['path'], self.cache['file'])
+		
+		session  = None
+		version  = None
+		hostname = None
+		
+		if os.path.exists(cache_file_path):
+			file = open(cache_file_path, 'r')
+			line = file.read().rstrip()
+			file.close()
+			
+			try:
+				(hostname, session, version) = line.split(':', 3)
+			except ValueError:
+				pass
+				
+		if session and version:
+			stub = SoapStubAdapter( host=self.session['hostname'],
+									version=version )
+			stub.cookie = "vmware_soap_session=\"%s\"; Path=/; HttpOnly; Secure;" % session
+			stub.state = 1
+			self.instance = vim.ServiceInstance("ServiceInstance", stub)
+			
+		self.session['session'] = session
+		self.session['version'] = version			
+		return
+
+	def save_session(self):
+		cache_file_path = os.path.join(self.cache['path'], self.cache['file'])
+		
+		for i in range(len(CACHE_PATH)):
+			segment_path = os.path.join( os.getenv("HOME"), 
+										 os.path.sep.join(CACHE_PATH[0:i+1]) )
+			if not os.path.exists(segment_path):
+				os.mkdir(segment_path)
+				os.chmod(segment_path, stat.S_IRWXU)
+			
+		session = re.search('vmware_soap_session=\\"(.*)\\"', self.instance._stub.cookie).group(1)
+		version = self.instance._stub.version
+			
+		# Write session to cache			
+		file = open(cache_file_path, 'w')
+		file.write("%s:%s:%s\n" % (self.session['hostname'], session, version))
+		file.close()
+		os.chmod(cache_file_path, stat.S_IRUSR|stat.S_IWUSR)
+		return	
+				
+	def is_active(self):
+		active  = False
+		current = None
+		
+		# SessionIsActive() is not implemented on ESXi. To validate a session, inspect
+		# the currentSession (UserSession) property of SessionManager.
+		if self.instance:
+			try:
+				current = self.instance.RetrieveContent().sessionManager.currentSession
+			except Exception as e:
+				active = False
+			
+			if current:
+				active = True
+		return active
+		
+	def login(self):
+		try:
+			self.instance = SmartConnect( host=self.session['hostname'],
+										  user=self.session['username'],
+										  pwd =self.session['password'] )
+		except Exception as e:
+			self.exception = e
+		
+		if self.instance:
+			self.save_session()
+		return	
+
+	def logout(self):
+		if self.instance:
+			sm = self.instance.RetrieveContent().sessionManager
+			try:
+				sm.Logout()
+			except Exception as e:
+				self.exception = e
+		return	
+		
+		
+def main():
+	module = AnsibleModule(
+		argument_spec = dict(
+			state	 = dict(type='str', required=True,  choices=["absent", "present"]),
+			session  = dict(type='str', required=False, default=None),
+			hostname = dict(type='str', required=False, default=None),
+			username = dict(type='str', required=False, default=None),
+			password = dict(type='str', required=False, default=None, no_log=True),
+		),
+		supports_check_mode = True,
+	)
+	
+	session = SessionCache(	module.params['session' ],
+							module.params['hostname'], 
+					   		module.params['username'], 
+					   		module.params['password'] )
+	
+	result = dict(changed=False, state='present')
+	
+	active = session.is_active()
+	
+	if active:
+		content = session.instance.RetrieveContent()
+		currentSession = content.sessionManager.currentSession
+		result['state'] = 'present'
+		result['session'] = { }
+		result['session']['fullName'] 		= currentSession.fullName
+		result['session']['ipAddress'] 		= currentSession.ipAddress
+		result['session']['lastActiveTime'] = currentSession.lastActiveTime.isoformat()
+		result['session']['loginTime'] 		= currentSession.loginTime.isoformat()
+		result['session']['userName'] 		= currentSession.userName
+		result['session']['key']			= currentSession.key
+		result['cache'] = session.cache['file']
+	else:
+		result['state'] = 'absent'
+	
+	if module.check_mode:
+		result['changed'] = False
+		if active:
+			result['state'] = 'present'
+		else:
+			result['state'] = 'absent'
+		module.exit_json(**result)
+		
+	# TODO: Use 'state' parameter for controlling login and logout? (present/absent)
+	# TODO: Add a 'refresh' action?
+	if module.params['state'].lower() == 'present':
+		if active:			
+			result['changed'] = False
+		else:
+			session.login()
+			if session.exception:
+				module.fail_json(msg=session.exception.message)	
+			content = session.instance.RetrieveContent()
+			currentSession = content.sessionManager.currentSession
+			result['state'] = 'present'
+			result['session'] = { }
+			result['session']['fullName'] 		= currentSession.fullName
+			result['session']['ipAddress'] 		= currentSession.ipAddress
+			result['session']['lastActiveTime'] = currentSession.lastActiveTime.isoformat()
+			result['session']['loginTime'] 		= currentSession.loginTime.isoformat()
+			result['session']['userName'] 		= currentSession.userName
+			result['session']['key']			= currentSession.key
+			result['cache'] = session.cache['file']
+			result['changed'] = True
+	
+	if module.params['state'].lower() == 'absent':
+		if active:
+			session.logout()
+			if session.exception:
+				module.fail_json(msg=session.exception.message)
+			result['changed'] = True
+			result['state'] = 'absent'
+		else:
+			result['changed'] = False
+			result['state'] = 'absent'
+
+	module.exit_json(**result)
+	
+	
+from ansible.module_utils.basic import *
+main()
