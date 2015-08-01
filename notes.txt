@@ -1,5 +1,0 @@
-Clean up vsphere_session, handle passed registered var more eloquently (since it's required
-for passing around to vcenter objects and logouts, etc)
-
-register: playbook action adds to host var, so can have same var in later play with same host
-
