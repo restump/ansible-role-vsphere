@@ -32,6 +32,10 @@ options:
 		default: present
 		description:
 			- Invoke requested session action (update)
+	session:
+	    required: false
+	    description:
+	        - Existing vSphere session
 	hostname:
 		required: true
 		description:
@@ -97,8 +101,7 @@ class SessionCache(object):
 				pass
 				
 		if session and version:
-			stub = SoapStubAdapter( host=self.session['hostname'],
-									version=version )
+			stub = SoapStubAdapter( hostname, version=version )
 			stub.cookie = "vmware_soap_session=\"%s\"; Path=/; HttpOnly; Secure;" % session
 			stub.state = 1
 			self.instance = vim.ServiceInstance("ServiceInstance", stub)
@@ -197,7 +200,7 @@ def main():
 		result['session']['loginTime'] 		= currentSession.loginTime.isoformat()
 		result['session']['userName'] 		= currentSession.userName
 		result['session']['key']			= currentSession.key
-		result['cache'] = session.cache['file']
+		result['cache'] = session.cache
 	else:
 		result['state'] = 'absent'
 	
@@ -228,7 +231,7 @@ def main():
 			result['session']['loginTime'] 		= currentSession.loginTime.isoformat()
 			result['session']['userName'] 		= currentSession.userName
 			result['session']['key']			= currentSession.key
-			result['cache'] = session.cache['file']
+			result['cache'] = session.cache
 			result['changed'] = True
 	
 	if module.params['state'].lower() == 'absent':

@@ -1,0 +1,252 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+# (c) 2015, Reuben Stump <reuben.stump@gmail.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at 
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+DOCUMENTATION = '''
+---
+module: vsphere_entities
+author: Reuben Stump
+version_added: "1.9"
+short_description: Find vSphere entities
+requirements:
+    - pyvmomi
+description:
+    - Find vSphere managed entities
+options:
+    session:
+        required: true
+        description:
+            - Session cache from vsphere_session
+    types:
+        required: true
+        description:
+            - List of entity types to find
+'''
+
+from pyVmomi        import vim, SoapStubAdapter, vmodl
+from pyVim.connect  import SmartConnect
+import md5, os, stat, requests, datetime
+
+# Disable certificate validation warnings; not ideal, but non-json output will impact
+# Ansible runtime
+requests.packages.urllib3.disable_warnings()
+
+CACHE_PATH = ['.ansible', 'vsphere', 'cache']
+
+class SessionCache(object):
+    def __init__(self, cache=None, hostname='localhost', username='root', password=None):
+        
+        self.cache = dict(
+            file = cache,
+            path = os.path.join(os.getenv("HOME"), os.path.sep.join(CACHE_PATH)) )
+        self.session = dict(
+            hostname = hostname,
+            username = username,
+            password = password,
+            version  = None,
+            session  = None )
+            
+        if not self.cache['file']:
+            digest = md5.new(username + " " + hostname)
+            self.cache['file'] = digest.hexdigest()
+        
+        self.exception = None
+        self.instance  = None
+        self.load_session()
+        return
+        
+    def load_session(self):
+        cache_file_path = os.path.join(self.cache['path'], self.cache['file'])
+        
+        session  = None
+        version  = None
+        hostname = None
+        
+        if os.path.exists(cache_file_path):
+            file = open(cache_file_path, 'r')
+            line = file.read().rstrip()
+            file.close()
+            
+            try:
+                (hostname, session, version) = line.split(':', 3)
+            except ValueError:
+                pass
+        
+        if session and version:
+            stub = SoapStubAdapter( host=hostname,
+                                    version=version )
+            stub.cookie = "vmware_soap_session=\"%s\"; Path=/; HttpOnly; Secure;" % session
+            stub.state = 1
+            self.instance = vim.ServiceInstance("ServiceInstance", stub)
+            
+        self.session['hostname'] = hostname
+        self.session['session']  = session
+        self.session['version']  = version           
+        return
+
+    def save_session(self):
+        cache_file_path = os.path.join(self.cache['path'], self.cache['file'])
+        
+        for i in range(len(CACHE_PATH)):
+            segment_path = os.path.join( os.getenv("HOME"), 
+                                         os.path.sep.join(CACHE_PATH[0:i+1]) )
+            if not os.path.exists(segment_path):
+                os.mkdir(segment_path)
+                os.chmod(segment_path, stat.S_IRWXU)
+            
+        session = re.search('vmware_soap_session=\\"(.*)\\"', self.instance._stub.cookie).group(1)
+        version = self.instance._stub.version
+            
+        # Write session to cache            
+        file = open(cache_file_path, 'w')
+        file.write("%s:%s:%s\n" % (self.session['hostname'], session, version))
+        file.close()
+        os.chmod(cache_file_path, stat.S_IRUSR|stat.S_IWUSR)
+        return  
+                
+    def is_active(self):
+        active  = False
+        current = None
+        
+        # SessionIsActive() is not implemented on ESXi. To validate a session, inspect
+        # the currentSession (UserSession) property of SessionManager.
+        if self.instance:
+            try:
+                current = self.instance.RetrieveContent().sessionManager.currentSession
+            except Exception as e:
+                active = False
+            
+            if current:
+                active = True
+        return active
+        
+    def login(self):
+        try:
+            self.instance = SmartConnect( host=self.session['hostname'],
+                                          user=self.session['username'],
+                                          pwd =self.session['password'] )
+        except Exception as e:
+            self.exception = e
+        
+        if self.instance:
+            self.save_session()
+        return  
+
+    def logout(self):
+        if self.instance:
+            sm = self.instance.RetrieveContent().sessionManager
+            try:
+                sm.Logout()
+            except Exception as e:
+                self.exception = e
+        return  
+
+def find_entities(instance=None, types=[ ]):
+
+    content = instance.RetrieveContent()
+    pcoll   = content.propertyCollector
+    
+    options = vmodl.query.PropertyCollector.RetrieveOptions()
+    specSet = vmodl.query.PropertyCollector.FilterSpec()
+        
+    container_view = content.viewManager.CreateContainerView(
+        container=content.rootFolder,
+        type=[ ],
+        recursive=True )
+    
+    propSet = [ ]
+    for type in types:
+        entity_class = getattr(vim, type)
+
+        spec = vim.PropertyCollector.PropertySpec(
+            all=False,
+            pathSet=['name'],
+            type=entity_class )
+        propSet.append(spec)
+            
+    objectSet = [ ]
+    # Create objecSet item for the container view
+    spec = vim.PropertyCollector.ObjectSpec(
+        obj=container_view,
+        selectSet=[ vim.PropertyCollector.TraversalSpec(
+                        path='view',
+                        skip=False,
+                        type=vim.view.ContainerView ) ],
+        skip=False )
+    objectSet.append(spec)
+            
+    filter_spec = vim.PropertyCollector.FilterSpec(
+        objectSet=objectSet,
+        propSet=propSet,
+        reportMissingObjectsInResults=False )
+    
+    entities = [ ]
+    results = content.propertyCollector.RetrievePropertiesEx(
+        specSet=[filter_spec],
+        options=options ) 
+    entities.append(parse_results(results.objects))
+    
+    token = results.token
+    while token:
+        results = content.propertyCollector.ContinueRetrievePropertiesEx(
+            token=token)
+        entities.append(parse_results(results.objects))
+        token = results.token
+    return entities 
+    
+def parse_results(objects):
+    results = [ ]
+    for content in objects:
+        obj     = content.obj
+        propSet = content.propSet
+        
+        type  = obj._wsdlName
+        value = obj._moId
+        
+        this = { '_type': type, '_value': value  }
+        
+        # Iterate over returned property sets and stash them in the inventory dictionary
+        # Implications here are requested name paths are keys, but values may be objects
+        for prop in propSet:
+            name = prop.name
+            val  = prop.val
+            this['name'] = val
+        results.append(this)
+    return results
+    
+        
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            session = dict(type='dict', required=True),
+            types   = dict(type='list', required=True),
+        ),
+        supports_check_mode = True,
+    )
+    
+    session = SessionCache(module.params['session']['file'], None, None, None)
+    
+    if not session.is_active():
+        module.fail_json(msg=session.exception.message)
+    
+    result = dict(changed=False)
+    result['entities'] = find_entities(session.instance, module.params['types'])
+
+    module.exit_json(**result)
+    
+    
+from ansible.module_utils.basic import *
+main()

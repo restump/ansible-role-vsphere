@@ -1,5 +1,5 @@
 ---
-- hosts: vce-s1
+- hosts: vce-01
   connection: local
   gather_facts: no
   
@@ -20,5 +20,46 @@
         hostname: "{{ inventory_hostname }}"
         username: "{{ vsphere_username }}"
         password: "{{ vsphere_password }}"
-      register: result
-    - debug: msg="Session key = {{ result.session.key }}"
+      register: session
+      
+    - name: Find entities
+      vsphere_entities:
+        session: "{{ session.cache }}"
+        types: ['VirtualMachine']
+      register: entities
+      
+#    - name: show it
+#      debug: msg="{{ entities.entities }}"
+    
+    - name: Add ansible inventory hosts
+      no_log: yes
+      add_host:
+        name: "{{ item.name }}"
+        group: vms
+        vsphere_var: "{{ item._type }}"
+        vsphere_session: "{{ session }}"
+      with_items: "{{ entities.entities }}"
+      
+- hosts: vms
+  connection: local
+  gather_facts: no
+  
+  tasks:
+    - name: Print it
+      debug: 
+        msg: "{{ vsphere_session }}"
+        
+
+- hosts: vce-01
+  connection: local
+  gather_facts: no
+  
+  tasks:
+    - name: Session debug
+      debug:
+        msg: "{{ session }}"
+    
+    - name: Logoff vSphere session
+      vsphere_session:
+        state: absent
+        session: "{{ session.cache.file }}"
